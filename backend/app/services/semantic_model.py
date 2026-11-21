@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.schema_diff import model_matches_source, split_fields
 from app.store import store
 
 
@@ -92,17 +93,20 @@ class SemanticModelService(BaseModuleService):
         for model in models:
             if model.get("status") != "已投产":
                 continue
-            if str(source_id) not in str(model.get("源表映射", "")):
+            # 按完整来源标识匹配，避免 source_registry:1 命中 :10。
+            if not model_matches_source(model, source_id, module="source_registry"):
                 continue
 
-            current_fields = set(model.get("字段别名", "").split(","))
-            current_fields = {f.strip() for f in current_fields if f.strip()}
+            current_fields = split_fields(model.get("字段别名"))
 
-            # 检测 data_lake_read 中的Schema变更
+            # 检测 data_lake_read 中该来源的Schema变更（按完整来源标识匹配）
             lake_rows = store.rows("data_lake_read")
             for lake in lake_rows:
                 schema_changes = lake.get("Schema推导", "")
-                if "source_registry" in lake.get("存储位置", "") and str(source_id) in lake.get("存储位置", ""):
+                if (
+                    lake.get("文件格式") == "schema_change"
+                    and str(lake.get("存储位置", "")) == f"source_registry/{source_id}"
+                ):
                     conflicts.append({
                         "model_id": model["id"],
                         "model_name": model.get("模型名称"),

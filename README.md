@@ -81,5 +81,28 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 来源字段差异
+
+来源探测的取数链路固定在 `backend/app/services/source_registry.py`：
+
+1. `_probe_fields` 取当前探测字段（一行一列），不再把存录的整串字段当一列；
+2. `_get_semantic_models_for_source` 按完整来源标识（`source_registry:<id>` /
+   完整源编号）取模型，`source_registry:1` 不会命中 `:10`；
+3. `_build_basis` 固定本轮探测快照和**单一**模型版本映射（深拷贝 + 指纹），
+   比较期间别人改「字段别名」不会让一条差异混用两份定义；
+4. `schema_diff.field_diff` 分列比较，忽略分隔符/包装字符/空白/大小写和纯顺序变化；
+5. `_confirm_diff` 在 `scan_guard()` 内按差异指纹去重，同一真实变化只确认一次，
+   已发布的历史湖仓差异会被复用而不是重复登记；
+6. 确认结果写入来源差异清单 `source_schema_diff`，再由
+   `DataLakeReadService.record_source_field_diff` 写入湖仓「实际字段差异」记录
+   （含扫描批次、差异依据、实际增删字段），并把湖仓记录 id 回写到清单。
+
+相关接口：
+
+- `POST /api/pipelines/source-schema-scan?source_id=&probe_fields=` 扫描来源并回写湖仓；
+- `GET /api/pipelines/source-schema-diffs?source_id=` 来源差异清单 + 关联湖仓记录；
+- `GET /api/pipelines/lake-schema-diffs?source_id=` 湖仓实际字段差异记录；
+- 湖仓读取页面内置「来源实际字段差异」查询面板，可按来源 id 核对差异与扫描批次。
+
 领域：数据工程
 子方向：数据分析与数据应用

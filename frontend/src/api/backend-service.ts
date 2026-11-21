@@ -59,3 +59,42 @@ export async function loadOverview(): Promise<OverviewResult> {
   if (!response.ok) throw new Error('运营概览读取失败')
   return await response.json()
 }
+
+export type SourceSchemaDiff = {
+  来源差异编号: string
+  来源编号?: string | null
+  source_id: number
+  扫描批次: string
+  新增字段: string
+  移除字段: string
+  新增字段数: number
+  移除字段数: number
+  变化摘要: string
+  差异指纹: string
+  湖仓记录id?: number | null
+  湖仓差异状态?: string
+  湖仓记录?: {
+    id: number
+    路径编号: string
+    存储位置: string
+    扫描批次: string
+    实际字段差异: string
+    Schema推导: string
+    最后扫描: string
+    status: string
+  } | null
+}
+
+export type SourceSchemaDiffResult = {
+  ok: boolean
+  source_id: number
+  source_no?: string
+  items: SourceSchemaDiff[]
+  total: number
+}
+
+export async function listSourceSchemaDiffs(sourceId: number): Promise<SourceSchemaDiffResult> {
+  const response = await request(`/api/pipelines/source-schema-diffs?source_id=${sourceId}`)
+  if (!response.ok) throw new Error('来源差异清单读取失败')
+  return await response.json()
+}

@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.schema_diff import scan_guard
 from app.store import store
 
 
@@ -113,12 +114,14 @@ class DataContractService(BaseModuleService):
         contract["Schema约束"] = new_schema
         contract["pending"] = True
 
-        # 通知语义模型
+        # 通知语义模型：与来源扫描共用同一把锁，扫描进行中改别名不会让
+        # 一轮比较用到半新半旧的字段定义。
         models = store.rows("semantic_model")
-        for m in models:
-            if contract.get("数据集", "") in str(m.get("源表映射", "")):
-                m["字段别名"] = new_schema
-                m["pending"] = True
+        with scan_guard():
+            for m in models:
+                if contract.get("数据集", "") in str(m.get("源表映射", "")):
+                    m["字段别名"] = new_schema
+                    m["pending"] = True
 
         # 写入审计
         rows = store.rows("query_audit")

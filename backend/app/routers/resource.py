@@ -11,9 +11,14 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
+from app.services import data_lake_read as lake_domain
+from app.services.schema_diff import stable_json
 from app.store import store
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
+# 管道接口全部走独立路由，并在通用动态路由之前注册，避免 /{module}/{entry_id}
+# 抢先匹配 GET /pipelines/xxx。
+pipeline_router = APIRouter(prefix="/api", tags=["跨模块管道"])
 
 
 def require_service(module: str):
@@ -112,7 +117,7 @@ cost_svc = CostGovernService()
 contract_svc = DataContractService()
 
 
-@router.post("/pipelines/source-to-federated")
+@pipeline_router.post("/pipelines/source-to-federated")
 def pipeline_source_to_federated(
     source_no: str = Query(...), source_type: str = Query(default="mysql"),
     source_addr: str = Query(default="db://demo/mydb"),
@@ -136,7 +141,7 @@ def pipeline_source_to_federated(
             "schema": schema_r, "federation_plan": plan, "execution": exec_r}
 
 
-@router.post("/pipelines/cube-build-cache")
+@pipeline_router.post("/pipelines/cube-build-cache")
 def pipeline_cube_build_cache(
     cube_no: str = Query(...), cube_name: str = Query(...),
     dims: str = Query(default="region,category"), measures: str = Query(default="revenue,orders"),
@@ -154,7 +159,7 @@ def pipeline_cube_build_cache(
             "consistency": agg_cache_svc.check_cache_consistency(cid)}
 
 
-@router.post("/pipelines/rewrite-estimate-execute")
+@pipeline_router.post("/pipelines/rewrite-estimate-execute")
 def pipeline_rewrite_estimate_execute(
     query: str = Query(default="SELECT * FROM source_registry"),
     model_ids: str = Query(default=""),
@@ -168,7 +173,7 @@ def pipeline_rewrite_estimate_execute(
                                   "estimated_savings": rr["estimated_savings_rows"]}}
 
 
-@router.post("/pipelines/query-audit-profile")
+@pipeline_router.post("/pipelines/query-audit-profile")
 def pipeline_query_audit_profile(
     query_stmt: str = Query(default="FEDERATED_QUERY plan_id=1"),
 ) -> dict[str, Any]:
@@ -180,19 +185,48 @@ def pipeline_query_audit_profile(
             "profile": profile, "report": report}
 
 
-@router.post("/pipelines/schema-drift-detect")
-def pipeline_schema_drift_detect(source_id: int = Query(...)) -> dict[str, Any]:
-    schema_r = source_svc.detect_schema_changes(source_id)
+@pipeline_router.post("/pipelines/schema-drift-detect")
+def pipeline_schema_drift_detect(
+    source_id: int = Query(...), probe_fields: str | None = Query(default=None),
+) -> dict[str, Any]:
+    schema_r = source_svc.detect_schema_changes(source_id, probe_fields)
     conflicts = semantic_svc.detect_schema_conflicts(source_id)
     affected = [{"contract_id": c["id"], "消费者": c.get("消费者"),
                  "violations": contract_svc.verify_contract_compliance(c["id"]).get("violations", [])}
                 for c in store.rows("data_contract")
                 if c.get("status") == "已承诺" and contract_svc.verify_contract_compliance(c["id"]).get("violations")]
     return {"ok": True, "pipeline": "schema_drift_detect", "source_id": source_id,
-            "schema_changes": schema_r, "model_conflicts": conflicts, "affected_contracts": affected}
+            "schema_changes": schema_r, "model_conflicts": conflicts, "affected_contracts": affected,
+            "source_schema_diffs": source_svc.list_schema_diffs(source_id)}
 
 
-@router.post("/pipelines/export-to-mart")
+@pipeline_router.post("/pipelines/source-schema-scan")
+def pipeline_source_schema_scan(
+    source_id: int = Query(...), probe_fields: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """来源探测取数链路：扫描来源 → 确认实际字段差异 → 湖仓登记 → 回写清单。"""
+    scan = source_svc.detect_schema_changes(source_id, probe_fields)
+    if not scan.get("ok"):
+        raise HTTPException(status_code=404, detail=scan.get("message", "数据源不存在"))
+    return {"ok": True, "pipeline": "source_schema_scan", "schema_changes": scan,
+            "source_schema_diffs": source_svc.list_schema_diffs(source_id),
+            "lake_records": lake_domain.list_lake_diff_records(source_id)}
+
+
+@pipeline_router.get("/pipelines/source-schema-diffs")
+def pipeline_source_schema_diffs(source_id: int = Query(...)) -> dict[str, Any]:
+    """来源差异清单（含关联的湖仓实际差异记录）。"""
+    return source_svc.list_schema_diffs(source_id)
+
+
+@pipeline_router.get("/pipelines/lake-schema-diffs")
+def pipeline_lake_schema_diffs(source_id: int = Query(default=0)) -> dict[str, Any]:
+    """湖仓实际字段差异记录；传 source_id 时只看该来源。"""
+    records = lake_domain.list_lake_diff_records() if source_id <= 0 else lake_domain.list_lake_diff_records(source_id)
+    return {"ok": True, "source_id": source_id or None, "items": records, "total": len(records)}
+
+
+@pipeline_router.post("/pipelines/export-to-mart")
 def pipeline_export_to_mart(
     export_no: str = Query(...), fmt: str = Query(default="csv"), mart_id: int = Query(default=0),
 ) -> dict[str, Any]:
@@ -207,7 +241,7 @@ def pipeline_export_to_mart(
             "mart": exporter_svc.batch_export_to_mart(mart_id) if mart_id > 0 else None}
 
 
-@router.post("/pipelines/lake-scan-register")
+@pipeline_router.post("/pipelines/lake-scan-register")
 def pipeline_lake_scan_register(path_id: int = Query(...)) -> dict[str, Any]:
     return {"ok": True, "pipeline": "lake_scan_register",
             "scan": lake_svc.scan_and_register(path_id),
@@ -215,7 +249,7 @@ def pipeline_lake_scan_register(path_id: int = Query(...)) -> dict[str, Any]:
             "cost": lake_svc.estimate_partition_scan_cost(path_id, ("2026-11-01", "2026-11-17"))}
 
 
-@router.post("/pipelines/cost-aggregate-alert")
+@pipeline_router.post("/pipelines/cost-aggregate-alert")
 def pipeline_cost_aggregate_alert() -> dict[str, Any]:
     return {"ok": True, "pipeline": "cost_aggregate_alert",
             "cost_aggregation": cost_svc.aggregate_module_costs(),

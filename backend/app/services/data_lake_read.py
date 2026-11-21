@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 import uuid
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.schema_diff import field_diff, scan_guard, split_fields, stable_json
 from app.store import store
 
 
@@ -19,6 +21,74 @@ class DataLakeReadService(BaseModuleService):
     STATUS_ORDER = ["待扫描", "已注册", "Schema变更", "已停用"]
     ACTION_RULES = {"启动扫描": "已注册", "注册路径": "Schema变更", "停用路径": "已停用"}
     NEGATIVE_ACTIONS = ["停用路径"]
+
+    def record_source_field_diff(
+        self, diff_row: dict[str, Any], source_entry: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """把来源已确认的字段差异登记为湖仓实际差异记录。
+
+        只消费来源差异清单里已经落定的口径（探测依据 + 单一模型版本映射），
+        不重新探测、不重新读模型，因此不会与来源侧的另一轮扫描混用定义。
+        同一来源同一差异指纹只登记一次，重复扫描不会新增批次。
+        """
+        source_id = diff_row.get("source_id")
+        if source_id in (None, ""):
+            return None
+        source_id = int(source_id)
+        diff_key = str(diff_row.get("差异指纹") or diff_row.get("来源差异编号") or "")
+        batch = str(diff_row.get("扫描批次") or "")
+
+        # 与来源侧扫描共用同一把锁：查重和写入必须原子，否则两个批次会各写一条。
+        with scan_guard():
+            rows = store.rows(self.MODULE)
+            for row in rows:
+                if (
+                    row.get("文件格式") == "schema_change"
+                    and str(row.get("存储位置")) == f"source_registry/{source_id}"
+                    and (str(row.get("差异指纹") or "") == diff_key
+                         or (batch and str(row.get("扫描批次") or "") == batch))
+                ):
+                    # 已登记过同一差异：补齐引用即可，不产生第二条实际差异记录。
+                    _ensure_diff_fields(row, diff_row)
+                    return row
+
+            record_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+            additions = diff_row.get("新增字段", "")
+            removals = diff_row.get("移除字段", "")
+            record = {
+                "id": record_id,
+                "路径编号": f"DATA-SC{source_id:04d}-{record_id:04d}",
+                "存储位置": f"source_registry/{source_id}",
+                "文件格式": "schema_change",
+                "分区模式": "N/A",
+                "Schema推导": diff_row.get("变化摘要") or f"+{additions} / -{removals}",
+                "实际字段差异": stable_json({
+                    "新增字段": _as_list(additions),
+                    "移除字段": _as_list(removals),
+                    "变化摘要": diff_row.get("变化摘要"),
+                }),
+                "来源差异编号": diff_row.get("来源差异编号"),
+                "来源差异id": diff_row.get("id"),
+                "source_id": source_id,
+                "来源编号": diff_row.get("来源编号")
+                or (source_entry or {}).get("源编号"),
+                "扫描批次": batch,
+                "差异指纹": diff_key,
+                "差异依据": diff_row.get("差异依据"),
+                "文件列表": "",
+                "最后扫描": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "数据量": str(diff_row.get("新增字段数", 0) + diff_row.get("移除字段数", 0)),
+                "status": "Schema变更",
+                "pending": True,
+                "abnormal": bool(diff_row.get("移除字段数")),
+            }
+            rows.append(record)
+            _write_source_diff_audit(record)
+            return record
+
+    def list_lake_diff_records(self, source_id: int | None = None) -> list[dict[str, Any]]:
+        """湖仓实际字段差异记录，供来源差异清单关联核对。"""
+        return list_lake_diff_records(source_id)
 
     def scan_and_register(self, path_id: int) -> dict[str, Any]:
         """扫描湖仓路径：写入 source_registry、semantic_model、query_audit、data_contract。"""
@@ -72,15 +142,15 @@ class DataLakeReadService(BaseModuleService):
             return {"ok": False, "message": "湖仓路径不存在"}
 
         storage = path_entry.get("存储位置", "")
-        recorded_schema = path_entry.get("Schema推导", "").split(",")
-        recorded_schema = [s.strip() for s in recorded_schema if s.strip()]
+        recorded_schema = split_fields(path_entry.get("Schema推导", ""))
 
-        # 重新扫描
-        new_schema = _derive_schema(path_entry.get("文件格式", "parquet"))
-        new_fields = [f for f in new_schema if f not in recorded_schema]
-        removed_fields = [f for f in recorded_schema if f not in new_schema]
+        # 重新扫描，并按字段列表比较（忽略格式和顺序），避免整串被当成一列。
+        new_schema = split_fields(_derive_schema(path_entry.get("文件格式", "parquet")))
+        diff = field_diff(new_schema, recorded_schema)
+        new_fields = diff["additions"]
+        removed_fields = diff["removals"]
 
-        has_drift = len(new_fields) > 0 or len(removed_fields) > 0
+        has_drift = diff["has_changes"]
 
         if has_drift:
             path_entry["Schema推导"] = ", ".join(new_schema)
@@ -142,6 +212,89 @@ class DataLakeReadService(BaseModuleService):
             "file_count": file_count,
             "cost_entry_id": cost_id,
         }
+
+
+def list_lake_diff_records(source_id: int | None = None) -> list[dict[str, Any]]:
+    """按来源列出湖仓写入的实际字段差异记录，供来源差异清单关联核对。
+
+    source_id 为空时返回全部来源的实际差异记录。
+    """
+    prefix = f"source_registry/{source_id}" if source_id not in (None, "") else None
+    records = []
+    for row in store.rows("data_lake_read"):
+        if row.get("文件格式") != "schema_change":
+            continue
+        if prefix is not None and str(row.get("存储位置")) != prefix:
+            continue
+        records.append({
+            "id": row.get("id"),
+            "路径编号": row.get("路径编号"),
+            "存储位置": row.get("存储位置"),
+            "source_id": row.get("source_id")
+            or _source_id_from_storage(row.get("存储位置")),
+            "来源编号": row.get("来源编号"),
+            "来源差异编号": row.get("来源差异编号"),
+            "扫描批次": row.get("扫描批次"),
+            "差异指纹": row.get("差异指纹"),
+            "实际字段差异": row.get("实际字段差异"),
+            "Schema推导": row.get("Schema推导"),
+            "差异依据": row.get("差异依据"),
+            "最后扫描": row.get("最后扫描"),
+            "status": row.get("status"),
+            "pending": row.get("pending"),
+            "abnormal": row.get("abnormal"),
+        })
+    return records
+
+
+def _source_id_from_storage(storage: Any) -> int | None:
+    match = re.fullmatch(r"source_registry/(\d+)", str(storage or ""))
+    return int(match.group(1)) if match else None
+
+
+def _as_list(raw: Any) -> list[str]:
+    """差异字段既可能是列表也可能已经是逗号串，统一摊平后去空。"""
+    if isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = str(raw if raw is not None else "").replace("，", ",").split(",")
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
+def _ensure_diff_fields(row: dict[str, Any], diff_row: dict[str, Any]) -> None:
+    """已登记的湖仓记录补齐来源侧引用，保持两侧口径一致。"""
+    for field in ("来源差异编号", "来源差异id", "扫描批次", "差异指纹", "差异依据"):
+        if diff_row.get(field) not in (None, "") and row.get(field) in (None, ""):
+            row[field] = diff_row.get(field)
+    if not row.get("实际字段差异"):
+        row["实际字段差异"] = stable_json({
+            "新增字段": _as_list(diff_row.get("新增字段")),
+            "移除字段": _as_list(diff_row.get("移除字段")),
+            "变化摘要": diff_row.get("变化摘要"),
+        })
+
+
+def _write_source_diff_audit(record: dict[str, Any]) -> None:
+    rows = store.rows("query_audit")
+    audit_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+    audit = {
+        "id": audit_id,
+        "记录编号": f"AUDIT-{uuid.uuid4().hex[:8]}",
+        "查询语句": (
+            f"LAKE_SCHEMA_DIFF source={record.get('source_id')} "
+            f"batch={record.get('扫描批次')} diff={record.get('来源差异编号')}"
+        ),
+        "执行耗时": "80ms",
+        "扫描行数": record.get("数据量", "0"),
+        "返回行数": "1",
+        "数据来源": "data_lake_read",
+        "操作用户": "lake_scanner",
+        "查询时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "正常",
+        "pending": False,
+        "abnormal": bool(record.get("abnormal")),
+    }
+    rows.append(audit)
 
 
 def _derive_schema(fmt: str) -> list[str]:
